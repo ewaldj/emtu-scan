@@ -66,7 +66,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
-VERSION = "0.14"
+VERSION = "0.16"
 
 IS_MACOS = platform.system() == "Darwin"
 
@@ -216,27 +216,32 @@ def classify_mtu_test(output: str) -> tuple:
             return False, "DF-Needed", int(m.group(1)), "local"
         return False, "LocalMTUTooSmall", None, "local"
     reachable = is_reachable(output)
+    # A parsed "rtt min/avg/max" line is concrete proof that a full-size
+    # DF-set echo reply genuinely came back (that line only exists in
+    # ping's output when at least one real round trip was measured) - so
+    # it wins over whatever the "packet loss" line claims, including an
+    # explicit "100% packet loss" (confirmed on real hardware: rows
+    # labelled Blackhole nonetheless carried a plausible, real
+    # RTT_MTU_Test_ms - either because no loss line could be matched at
+    # all, or because the loss line explicitly said 100% while a real rtt
+    # line was ALSO present in that same run - both are self-contradictory
+    # ping output, and in both cases the concrete rtt evidence is trusted
+    # over the loss-line claim rather than silently reported as a
+    # confirmed Blackhole).
+    if RE_RTT_AVG.search(output):
+        source = None if reachable is True else "rtt-present-despite-loss-claim"
+        return True, "OK", None, source
     if reachable is True:
+        # A clean "<100% packet loss" line was found, but this ping output
+        # has no rtt summary line at all (some ping variants/formats omit
+        # it) - still a plain, unambiguous OK, not the ambiguous case above.
         return True, "OK", None, None
     if reachable is False:
         return False, "Blackhole", None, None
-    # reachable is None: no "X% packet loss" line was found at all - this
-    # is a DIFFERENT situation from a confirmed 100% loss, and treating it
-    # as Blackhole was a real bug (confirmed on real hardware: rows
-    # labelled Blackhole nonetheless carried a plausible, real
-    # RTT_MTU_Test_ms - proof at least one full-size DF-set packet got a
-    # genuine echo reply, since RTT is parsed from the SAME ping run's
-    # "rtt min/avg/max" summary line, which only prints when a reply was
-    # actually received). If that summary line is present despite the
-    # packet-loss line not matching our expected wording, trust the
-    # concrete evidence (the rtt line) over the missing one: reachable,
-    # full size got through.
-    if RE_RTT_AVG.search(output):
-        return True, "OK", None, "loss-line-missing-rtt-present"
-    # Neither line was found: genuinely unparseable ping output (unexpected
-    # wording, truncated/garbled capture, etc.) - NOT a confirmed
-    # Blackhole. Flagged honestly as Error instead of guessing, so it's
-    # visible and reported rather than silently miscounted.
+    # reachable is None and no rtt line either: genuinely unparseable ping
+    # output (unexpected wording, truncated/garbled capture, etc.) - NOT a
+    # confirmed Blackhole. Flagged honestly as Error instead of guessing,
+    # so it's visible and reported rather than silently miscounted.
     return None, "Error", None, "unparseable-ping-output"
 
 
@@ -268,9 +273,6 @@ def mtu_test_host(ip: str, network: str, mtu: int, count: int, timeout_ms: int, 
             res.note = f"path MTU {reported} (local/cached PMTU, no live ICMP seen this scan)"
         else:
             res.note = f"router reports path MTU {reported}"
-    elif source == "loss-line-missing-rtt-present":
-        res.note = ("reachable at full size (rtt seen), but this ping's 'packet loss' line "
-                     "wasn't in the expected format - reported OK, not guessed as Blackhole")
     elif source == "unparseable-ping-output":
         res.note = ("ping output not recognized (no packet-loss or rtt line found) - "
                      "MTU/PMTUD result unknown, NOT a confirmed Blackhole")

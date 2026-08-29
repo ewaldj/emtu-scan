@@ -122,7 +122,7 @@ After the probe phase, `scanned_networks.txt` lists which subnets will be scanne
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+GNU Affero General Public License v3.0 — see [LICENSE](LICENSE).
 
 ## Author
 

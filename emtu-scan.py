@@ -66,7 +66,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
-VERSION = "0.13"
+VERSION = "0.14"
 
 IS_MACOS = platform.system() == "Darwin"
 
@@ -190,14 +190,22 @@ def run_ping(host: str, size: int, count: int, timeout_ms: int, df: bool, interv
         raise RuntimeError("system 'ping' binary not found")
 
 
-def is_reachable(output: str) -> bool:
+def is_reachable(output: str) -> Optional[bool]:
+    """True/False if a 'X% packet loss' line was found and parsed, or None
+    if no such line could be found at all - which is NOT the same thing as
+    100% loss (a real Blackhole) and must be handled separately by the
+    caller instead of being silently treated as unreachable. See
+    classify_mtu_test for why this distinction matters."""
     m = RE_PACKET_LOSS.search(output)
     if m:
         return int(m.group(1)) < 100
-    return False
+    return None
 
 
 def classify_mtu_test(output: str) -> tuple:
+    """Returns (mtu_ok, status, reported_mtu, source). `source` also carries
+    a short reason tag for the two ambiguous-output cases below, used by
+    mtu_test_host to leave an explanatory note."""
     if RE_FRAG_NEEDED.search(output):
         m = RE_FRAG_MTU.search(output)
         reported = int(m.group(1)) if m else None
@@ -207,9 +215,29 @@ def classify_mtu_test(output: str) -> tuple:
         if m:
             return False, "DF-Needed", int(m.group(1)), "local"
         return False, "LocalMTUTooSmall", None, "local"
-    if is_reachable(output):
+    reachable = is_reachable(output)
+    if reachable is True:
         return True, "OK", None, None
-    return False, "Blackhole", None, None
+    if reachable is False:
+        return False, "Blackhole", None, None
+    # reachable is None: no "X% packet loss" line was found at all - this
+    # is a DIFFERENT situation from a confirmed 100% loss, and treating it
+    # as Blackhole was a real bug (confirmed on real hardware: rows
+    # labelled Blackhole nonetheless carried a plausible, real
+    # RTT_MTU_Test_ms - proof at least one full-size DF-set packet got a
+    # genuine echo reply, since RTT is parsed from the SAME ping run's
+    # "rtt min/avg/max" summary line, which only prints when a reply was
+    # actually received). If that summary line is present despite the
+    # packet-loss line not matching our expected wording, trust the
+    # concrete evidence (the rtt line) over the missing one: reachable,
+    # full size got through.
+    if RE_RTT_AVG.search(output):
+        return True, "OK", None, "loss-line-missing-rtt-present"
+    # Neither line was found: genuinely unparseable ping output (unexpected
+    # wording, truncated/garbled capture, etc.) - NOT a confirmed
+    # Blackhole. Flagged honestly as Error instead of guessing, so it's
+    # visible and reported rather than silently miscounted.
+    return None, "Error", None, "unparseable-ping-output"
 
 
 RETRY_BACKOFF = (0.05, 0.2)
@@ -240,6 +268,12 @@ def mtu_test_host(ip: str, network: str, mtu: int, count: int, timeout_ms: int, 
             res.note = f"path MTU {reported} (local/cached PMTU, no live ICMP seen this scan)"
         else:
             res.note = f"router reports path MTU {reported}"
+    elif source == "loss-line-missing-rtt-present":
+        res.note = ("reachable at full size (rtt seen), but this ping's 'packet loss' line "
+                     "wasn't in the expected format - reported OK, not guessed as Blackhole")
+    elif source == "unparseable-ping-output":
+        res.note = ("ping output not recognized (no packet-loss or rtt line found) - "
+                     "MTU/PMTUD result unknown, NOT a confirmed Blackhole")
     return res
 
 
@@ -711,7 +745,11 @@ def _fmt_scan_line(r: HostResult) -> str:
         return f"[scan]  {r.ip:<15} {reach_word:<{_SCAN_LINE_REACH_WIDTH}} |{' ' * (_SCAN_LINE_MTU_WIDTH + 2)}|"
     mtu_field = _fmt_mtu_field(r)
     rtt = f"{r.rtt_mtu_test_ms:.2f}ms" if r.rtt_mtu_test_ms is not None else "NA"
-    note_tail = f" note={r.note}" if r.reachable is None and r.note else ""
+    # Shown whenever there IS a note, not just for the reachable=None/
+    # host-level-exception case - e.g. the mtu-level "ambiguous ping
+    # output" notes from mtu_test_host (see classify_mtu_test) need to be
+    # visible here too, not just in the xlsx/txt output.
+    note_tail = f" note={r.note}" if r.note else ""
     return (f"[scan]  {r.ip:<15} {reach_word:<{_SCAN_LINE_REACH_WIDTH}} | "
             f"{mtu_field:<{_SCAN_LINE_MTU_WIDTH}} | {r.pmtud_status:<{_SCAN_LINE_STATUS_WIDTH}} "
             f"rtt={rtt}{note_tail}")

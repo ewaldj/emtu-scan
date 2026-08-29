@@ -66,7 +66,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
-VERSION = "0.09"
+VERSION = "0.13"
 
 IS_MACOS = platform.system() == "Darwin"
 
@@ -266,6 +266,28 @@ _ICMP_EAGAIN_RETRIES = 5       # EAGAIN/EWOULDBLOCK on a non-blocking socket's s
 _ICMP_EAGAIN_RETRY_PAUSE = 0.005  # pause between EAGAIN retries (seconds); real, not zero-length,
                                    # so the kernel gets actual time to drain the send buffer
 
+_ICMP_MACOS_ARP_ERRNOS = ("EHOSTUNREACH", "EHOSTDOWN")  # macOS-only: sendto() on an unprivileged
+                                   # ICMP socket to a directly-connected host with no ARP cache
+                                   # entry yet fails SYNCHRONOUSLY - confirmed on real hardware
+                                   # with BOTH of these errno names on different runs against the
+                                   # same subnet (the BSD ARP-resolution-failure path can surface
+                                   # as either, and which one shows up isn't consistent - so both
+                                   # get the same treatment, not just EHOSTUNREACH). This differs
+                                   # from Linux, where the kernel queues the packet and ARPs
+                                   # transparently instead of failing the send. The failed macOS
+                                   # send itself triggers the ARP request, so a short retry once
+                                   # it resolves (typically single-digit ms on a local LAN)
+                                   # succeeds - same idea as the EAGAIN retry above, just for a
+                                   # different transient condition. NOT applied on Linux, where
+                                   # these errnos reliably mean "genuinely no route" and should
+                                   # stay a permanent failure.
+_ICMP_MACOS_ARP_RETRIES = 8
+_ICMP_MACOS_ARP_RETRY_PAUSE = 0.02  # seconds between macOS ARP-wait retries; longer than the
+                                     # EAGAIN pause since this waits on an actual ARP round trip,
+                                     # not just local buffer drain
+_ICMP_MACOS_ARP_ERRNO_VALUES = {getattr(errno, name) for name in _ICMP_MACOS_ARP_ERRNOS
+                                 if hasattr(errno, name)}
+
 
 def _icmp_checksum(data: bytes) -> int:
     if len(data) % 2:
@@ -288,9 +310,24 @@ def build_icmp_echo(identifier: int, seq: int) -> bytes:
 
 def parse_icmp_reply(data: bytes) -> Optional[tuple]:
     """Return (icmp_type, code, identifier, seq) or None if data is too
-    short to be a valid ICMP header. Unprivileged SOCK_DGRAM+IPPROTO_ICMP
-    sockets deliver just the ICMP message (no outer IP header), same as
-    what was sent."""
+    short to be a valid ICMP header. On Linux, unprivileged
+    SOCK_DGRAM+IPPROTO_ICMP sockets deliver just the ICMP message (no outer
+    IP header), same as what was sent - verified extensively on real Linux
+    hardware. macOS/BSD is DIFFERENT: the received datagram has the IPv4
+    header (20+ bytes, more with options) PREPENDED, even though sends
+    don't need one - confirmed on real hardware (a full scan against a
+    subnet where plain system `ping` got replies fine still showed 0%
+    reachable here, because every reply's ICMP header was being read at
+    the wrong offset and never matched). Detected structurally (IPv4
+    version nibble + protocol=ICMP byte) rather than assumed from platform
+    alone, and skipped before parsing the actual ICMP header. A real ICMP
+    reply can never false-trigger this check: its first byte is the ICMP
+    type (0 for echo reply), whose high nibble is 0, not 4."""
+    if len(data) >= 20:
+        version_ihl = data[0]
+        if (version_ihl >> 4) == 4 and data[9] == socket.IPPROTO_ICMP:
+            ihl_bytes = (version_ihl & 0x0F) * 4
+            data = data[ihl_bytes:]
     if len(data) < 8:
         return None
     icmp_type, code, checksum, identifier, seq = struct.unpack("!BBHHH", data[:8])
@@ -409,6 +446,18 @@ async def _icmp_alive_async(targets: List[str], timeout_s: float, retries: int,
         for chunk_start in range(0, len(targets), _ICMP_CHUNK_SIZE):
             chunk = targets[chunk_start:chunk_start + _ICMP_CHUNK_SIZE]
             remaining = list(chunk)
+            # Targets whose macOS ARP-retry budget already ran out once in an
+            # earlier round of THIS chunk. A host that didn't answer ARP
+            # after the full retry budget (real hardware: up to
+            # _ICMP_MACOS_ARP_RETRIES x _ICMP_MACOS_ARP_RETRY_PAUSE of active
+            # retrying) is, for practical purposes, proven not to be there -
+            # paying that same wait again on every icmp_retries round for a
+            # genuinely dead host is pure waste (confirmed on real hardware:
+            # a --full-scan with ~90% dead hosts took 10x longer on macOS
+            # than the identical scan on Linux, entirely from this). Once
+            # exhausted, later rounds get a single plain attempt for that
+            # host instead of the full retry budget again.
+            macos_arp_exhausted: Set[str] = set()
             for attempt in range(retries + 1):
                 if not remaining:
                     break
@@ -418,9 +467,10 @@ async def _icmp_alive_async(targets: List[str], timeout_s: float, retries: int,
                 for seq, ip in enumerate(remaining):
                     pending[seq] = ip
                 send_error_counts: Counter = Counter()
+                _send_max_attempts = max(_ICMP_EAGAIN_RETRIES, _ICMP_MACOS_ARP_RETRIES) + 1
                 for seq, ip in enumerate(remaining):
                     packet = build_icmp_echo(identifier, seq)
-                    for eagain_attempt in range(_ICMP_EAGAIN_RETRIES + 1):
+                    for send_attempt in range(_send_max_attempts):
                         try:
                             # Send on the raw socket directly, not via
                             # transport.sendto(): for an unconnected datagram
@@ -436,20 +486,42 @@ async def _icmp_alive_async(targets: List[str], timeout_s: float, retries: int,
                             sock.sendto(packet, (ip, 0))
                             break
                         except OSError as e:
-                            eagain = e.errno in (errno.EAGAIN, errno.EWOULDBLOCK)
-                            if eagain and eagain_attempt < _ICMP_EAGAIN_RETRIES:
+                            # NOTE: these are deliberately NOT named
+                            # retry_budget/retry_pause - this function's own
+                            # `retry_pause` parameter (the OUTER icmp-retries
+                            # round pause) lives in this same scope, and
+                            # reusing that name here would silently
+                            # overwrite it after the first send error.
+                            if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
                                 # Non-blocking socket, local send buffer is
                                 # momentarily full - by definition transient,
                                 # so retry the SAME send shortly instead of
                                 # treating this one packet as a dropped send.
-                                await asyncio.sleep(_ICMP_EAGAIN_RETRY_PAUSE)
+                                send_retry_budget, send_retry_pause = _ICMP_EAGAIN_RETRIES, _ICMP_EAGAIN_RETRY_PAUSE
+                            elif IS_MACOS and e.errno in _ICMP_MACOS_ARP_ERRNO_VALUES and ip not in macos_arp_exhausted:
+                                # macOS-only: no ARP entry yet for a
+                                # directly-connected host - see
+                                # _ICMP_MACOS_ARP_ERRNOS above. The failed
+                                # send just triggered the ARP request; retry
+                                # once it resolves. Skipped (falls through to
+                                # the permanent-failure branch below) if this
+                                # target already exhausted this budget in an
+                                # earlier round - see macos_arp_exhausted above.
+                                send_retry_budget, send_retry_pause = _ICMP_MACOS_ARP_RETRIES, _ICMP_MACOS_ARP_RETRY_PAUSE
+                            else:
+                                send_retry_budget, send_retry_pause = 0, 0
+                            if send_attempt < send_retry_budget:
+                                await asyncio.sleep(send_retry_pause)
                                 continue
-                            # Either a non-EAGAIN error (e.g. EHOSTUNREACH -
-                            # genuinely unroutable target, no point
-                            # retrying), or EAGAIN that didn't clear within
-                            # the retry budget. Break down by errno name so
-                            # the cause is visible directly in the warning
-                            # rather than guessed at afterwards.
+                            if IS_MACOS and e.errno in _ICMP_MACOS_ARP_ERRNO_VALUES:
+                                macos_arp_exhausted.add(ip)
+                            # Either a permanently-classified error (e.g.
+                            # EHOSTUNREACH on Linux - genuinely unroutable,
+                            # no point retrying), or a transient one that
+                            # didn't clear within its retry budget. Break
+                            # down by errno name so the cause is visible
+                            # directly in the warning rather than guessed at
+                            # afterwards.
                             key = errno.errorcode.get(e.errno, str(e.errno)) if e.errno is not None else "unknown"
                             send_error_counts[key] += 1
                             break

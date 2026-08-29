@@ -1,0 +1,10 @@
+emtu-scan.py v0.16 - run summary
+Command: python3 /usr/local/bin/emtu-scan 172.17.17.0/24 --mask 24
+Options (incl. unspecified defaults): mask=/24, mtu=1500, count=3, timeout=1000ms, interval=0.05s, workers=50, icmp-timeout=1.0s, icmp-retries=2, icmp-send-burst=500, icmp-send-pause=0.001s, full-scan=False, probe-hosts=default(first+last), outdir=./scan_results
+Runtime: 42.9s
+Hosts total: 254
+Reachable: 23 (9.1%)
+Unreachable: 231
+PMTUD status breakdown:
+  OK: 23
+  Unreachable: 231

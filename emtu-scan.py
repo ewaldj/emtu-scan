@@ -66,7 +66,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
-VERSION = "0.16"
+VERSION = "0.17"
 
 IS_MACOS = platform.system() == "Darwin"
 
@@ -768,6 +768,21 @@ def _ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b if b > 0 else 0
 
 
+def _collapse_subnets(subnets: List[ipaddress.IPv4Network]) -> List[ipaddress.IPv4Network]:
+    """Merge subnets that are adjacent and together exactly fill a larger
+    valid CIDR block into that single supernet - e.g. four /26s that together
+    span exactly one /24 are shown as that one /24 line instead of four
+    separate /26 lines. This is purely a display simplification for the
+    networks report: it never changes what gets scanned, only how the list
+    of subnets is presented, and it's independent of the --mask given for
+    the scan (the probe/expand phases still operate on the original
+    --mask-sized blocks either way). Uses the standard library's own
+    collapse_addresses(), so it only merges when the result is a single,
+    exactly-aligned CIDR - it never invents a supernet that would also cover
+    addresses outside the given subnets."""
+    return sorted(ipaddress.collapse_addresses(subnets), key=lambda s: int(s.network_address))
+
+
 def build_scanned_networks_report(active_subnets: List[ipaddress.IPv4Network],
                                    skipped_subnets: List[ipaddress.IPv4Network],
                                    probe_alive_count: int, probe_total: int,
@@ -808,13 +823,15 @@ def build_scanned_networks_report(active_subnets: List[ipaddress.IPv4Network],
         f"Skipped (probe failed on all its endpoints): {len(skipped_subnets)}",
         "",
         "Active subnets (CIDR, host count):",
+        "  (adjacent subnets that together exactly fill a larger CIDR block are "
+        "shown merged as that one block, regardless of the --mask used to scan)",
     ]
-    for sub in sorted(active_subnets, key=lambda s: int(s.network_address)):
+    for sub in _collapse_subnets(active_subnets):
         lines.append(f"  {str(sub):<20} {subnet_host_count(sub)}")
     if skipped_subnets:
         lines.append("")
         lines.append("Skipped subnets (CIDR):")
-        for sub in sorted(skipped_subnets, key=lambda s: int(s.network_address)):
+        for sub in _collapse_subnets(skipped_subnets):
             lines.append(f"  {sub}")
     lines += [
         "",
@@ -867,8 +884,10 @@ def build_full_scan_report(subnets: List[ipaddress.IPv4Network]) -> tuple:
         f"Total hosts: {total_target_hosts}",
         "",
         "Networks:",
+        "  (adjacent subnets that together exactly fill a larger CIDR block are "
+        "shown merged as that one block)",
     ]
-    for sub in subnets:
+    for sub in _collapse_subnets(subnets):
         lines.append(f"  {sub}  ({subnet_host_count(sub)} hosts)")
     summary_line = (
         f"[full-scan] {len(subnets)} subnet(s), {total_target_hosts} host(s) total - "

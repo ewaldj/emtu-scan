@@ -97,7 +97,7 @@ Ctrl+C aborts cleanly: hosts already scanned are still written to xlsx/txt, no t
   - `Unreachable` / `NotScanned` — the host didn't reply, or its subnet was skipped because the probe phase found nothing alive.
   - `RTT_MTU_Test_ms`: average RTT (ms) of the DF-set MTU test, parsed from the `rtt min/avg/max/...` summary already present in the ping output — no extra ping, no added runtime cost. Empty when the ping produced no rtt line (e.g. Blackhole, local error). `RTT_Reachability_ms` is always empty in this scanner — reachability is decided by the ICMP prober, which doesn't parse RTT; the column exists only for output-schema consistency.
 
-After the probe phase, `scanned_networks.txt` lists which subnets will be scanned (active vs. skipped) and a rough runtime estimate for the remaining phases, based on the probe phase's measured duration and alive-host ratio (`--full-scan` skips this estimate, since there is no probe-phase sample to base it on — it lists the full subnet/host count instead).
+After the probe phase, `scanned_networks.txt` lists which subnets will be scanned (active vs. skipped) and a rough runtime estimate for the remaining phases, based on the probe phase's measured duration and alive-host ratio (`--full-scan` skips this estimate, since there is no probe-phase sample to base it on — it lists the full subnet/host count instead). In that listing, adjacent subnets that together exactly fill a larger valid CIDR block are shown merged as that one block — e.g. four `--mask 26` subnets that together span a whole `/24` are shown as that single `/24` line, independent of the `--mask` used for the scan itself (only the display is merged; the underlying probe/expand phases are unaffected).
 
 ## Output (in the timestamped subfolder)
 

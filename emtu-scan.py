@@ -61,12 +61,11 @@ import subprocess
 import sys
 import time
 from collections import Counter
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
-VERSION = "0.17"
+VERSION = "0.22"
 
 IS_MACOS = platform.system() == "Darwin"
 
@@ -135,21 +134,40 @@ def parse_rtt_avg_ms(output: str) -> Optional[float]:
     return float(m.group(1)) if m else None
 
 
-@dataclass
 class HostResult:
-    ip: str
-    network: str
-    scanned: bool = True
-    reachable: Optional[bool] = None
-    mtu_tested: int = 0
-    mtu_ok: Optional[bool] = None
-    pmtud_status: str = "N/A"
-    df_needed_mtu: Optional[int] = None
-    rtt_reachability_ms: Optional[float] = None   # kept for output-schema consistency; the ICMP
-                                                    # reachability phase here doesn't parse RTT, so
-                                                    # this stays None - only rtt_mtu_test_ms is set
-    rtt_mtu_test_ms: Optional[float] = None
-    note: str = ""
+    """Per-host scan result. Deliberately a plain class with __slots__
+    instead of a @dataclass (which gives every instance its own __dict__) -
+    a --full-scan run keeps one of these in memory for EVERY host in the
+    given range for the whole scan, and on real hardware this was confirmed
+    to OOM-kill the process on both a 4GB and a 16GB machine after roughly
+    249 x /16-worth of hosts (~16.3M). __slots__ stores the attributes in a
+    fixed-size array instead of a per-instance dict, cutting memory per
+    instance roughly in half - the single biggest lever available here
+    without changing the output format itself."""
+    __slots__ = ("ip", "network", "scanned", "reachable", "mtu_tested", "mtu_ok",
+                 "pmtud_status", "df_needed_mtu", "rtt_reachability_ms",
+                 "rtt_mtu_test_ms", "note")
+
+    def __init__(self, ip: str, network: str, scanned: bool = True,
+                 reachable: Optional[bool] = None, mtu_tested: int = 0,
+                 mtu_ok: Optional[bool] = None, pmtud_status: str = "N/A",
+                 df_needed_mtu: Optional[int] = None,
+                 rtt_reachability_ms: Optional[float] = None,
+                 # kept for output-schema consistency; the ICMP reachability
+                 # phase here doesn't parse RTT, so this stays None - only
+                 # rtt_mtu_test_ms is set
+                 rtt_mtu_test_ms: Optional[float] = None, note: str = ""):
+        self.ip = ip
+        self.network = network
+        self.scanned = scanned
+        self.reachable = reachable
+        self.mtu_tested = mtu_tested
+        self.mtu_ok = mtu_ok
+        self.pmtud_status = pmtud_status
+        self.df_needed_mtu = df_needed_mtu
+        self.rtt_reachability_ms = rtt_reachability_ms
+        self.rtt_mtu_test_ms = rtt_mtu_test_ms
+        self.note = note
 
     def octet(self, n: int) -> int:
         return int(ipaddress.IPv4Address(self.ip).packed[n - 1])
@@ -927,6 +945,93 @@ def _build_expand_targets(subnets: List[ipaddress.IPv4Network], probe_ip_to_subn
     return expand_targets, expand_ip_to_subnet, notscanned_results
 
 
+# Caps how many hosts' worth of (ip, subnet) pairs are ever materialized into
+# a target list + ip->subnet dict at once for the expand/ICMP phase. Confirmed
+# on real hardware: a --full-scan across enough large subnets (~249 x /16
+# worth of hosts, ~16.3M) OOM-killed the process on BOTH a 4GB and a 16GB
+# machine, because the whole scan's target list and ip->subnet dict were built
+# in one shot before any ICMP work even started. Processing in bounded
+# batches instead means peak memory for this phase is O(batch size), not
+# O(total hosts in the scan) - the tradeoff is a small amount of pipelining
+# between ICMP batches (see _MAX_PENDING_MTU_FUTURES below for how the
+# MTU/DF-test thread pool still overlaps with later batches).
+#
+# Deliberately set equal to _ICMP_CHUNK_SIZE, NOT some larger multiple of it
+# (this used to be 500,000): icmp_alive() already processes its targets
+# internally in sequential _ICMP_CHUNK_SIZE-sized chunks, and only returns -
+# so scan() only gets to log anything - once ALL of them are done. Confirmed
+# on real hardware: with the old, much larger batch size, that meant several
+# consecutive internal chunks (each paying its own full ICMP retry-timeout
+# wait) had to finish before a single [scan] line appeared, showing up as the
+# display "hanging" for tens of seconds at a time on a mostly-dead range.
+# Matching the batch size to the chunk size makes scan() log after every
+# single chunk instead - the display updates every ~(icmp-retries+1) *
+# icmp-timeout seconds (a few seconds at the defaults) rather than every N
+# chunks' worth of that. This does NOT change _ICMP_CHUNK_SIZE itself (that
+# would be the costly change - see the comment on _ICMP_CHUNK_SIZE: each
+# chunk pays the same fixed retry-timeout wait regardless of its size, so
+# shrinking the chunk size directly multiplies total ICMP-phase runtime).
+# Batching by outer scan-level "how many hosts before we log/drain" is free
+# in comparison - just more, smaller icmp_alive() calls, each with the same
+# total chunk-processing work, plus negligible per-call socket setup - and
+# it also means an even smaller peak memory footprint for the expand-phase
+# target list/dict than the already-small one the 500,000 value gave.
+_EXPAND_BATCH_HOST_LIMIT = _ICMP_CHUNK_SIZE
+
+# Caps how many completed-or-in-flight MTU/DF-test futures scan() lets pile up
+# before it pauses expand-phase batching to drain some. Without a cap, a scan
+# where most hosts are reachable could accumulate millions of pending Future
+# objects (each with its own HostResult once done) before the final
+# concurrent.futures.wait() - the same unbounded-memory failure mode as the
+# expand-phase target list, just one stage later.
+_MAX_PENDING_MTU_FUTURES_PER_WORKER = 200
+
+
+def _iter_full_scan_pairs(subnets: List[ipaddress.IPv4Network]):
+    """Lazily yield (ip, subnet) pairs for --full-scan mode - every host in
+    every given subnet, no probe-phase filtering. A generator, not a
+    materialized list: see _EXPAND_BATCH_HOST_LIMIT above for why."""
+    for sub in subnets:
+        for ip in all_scan_targets(sub):
+            yield ip, sub
+
+
+def _iter_expand_pairs(subnets: List[ipaddress.IPv4Network],
+                        probed_by_subnet: Dict[ipaddress.IPv4Network, Set[str]],
+                        probed_ok: Dict[ipaddress.IPv4Network, bool]):
+    """Lazily yield (ip, subnet) pairs for the normal (non-full-scan) expand
+    phase - hosts in subnets whose probe succeeded, excluding hosts already
+    probed. Same lazy-generator idea as _iter_full_scan_pairs; kept as a
+    separate function (rather than reusing _build_expand_targets, which
+    intentionally still materializes everything - see its own test coverage)
+    so scan() can process very large expand sets in bounded batches."""
+    for sub in subnets:
+        if not probed_ok.get(sub):
+            continue
+        already = probed_by_subnet.get(sub, set())
+        for ip in all_scan_targets(sub):
+            if ip in already:
+                continue
+            yield ip, sub
+
+
+def _iter_target_batches(pairs, host_limit: int = _EXPAND_BATCH_HOST_LIMIT):
+    """Group a (possibly huge) stream of (ip, subnet) pairs into batches of
+    at most host_limit hosts each, yielding (targets, ip_to_subnet) per
+    batch. Bounds peak memory for the expand/ICMP phase to one batch at a
+    time regardless of total scan size."""
+    targets: List[str] = []
+    ip_to_subnet: Dict[str, ipaddress.IPv4Network] = {}
+    for ip, sub in pairs:
+        targets.append(ip)
+        ip_to_subnet[ip] = sub
+        if len(targets) >= host_limit:
+            yield targets, ip_to_subnet
+            targets, ip_to_subnet = [], {}
+    if targets:
+        yield targets, ip_to_subnet
+
+
 def scan(networks, mask, mtu, count, timeout_ms, workers, interval,
          icmp_timeout_s=1.0, icmp_retries=3, log=print, outdir: Optional[Path] = None,
          icmp_send_burst: int = _ICMP_SEND_YIELD_EVERY, icmp_send_pause: float = _ICMP_SEND_YIELD_SLEEP,
@@ -953,21 +1058,30 @@ def scan(networks, mask, mtu, count, timeout_ms, workers, interval,
     results: List[HostResult] = []
     interrupted = False
 
+    # Subnet CIDR strings are shared by every host in that subnet - compute
+    # each one once and reuse it, rather than calling str(sub) fresh inside a
+    # per-host loop (which used to create a new, otherwise-identical string
+    # object for every single host and was itself a real contributor to the
+    # OOM confirmed on real hardware for large --full-scan runs).
+    sub_str_cache: Dict[ipaddress.IPv4Network, str] = {}
+
+    def sub_str(sub: ipaddress.IPv4Network) -> str:
+        s = sub_str_cache.get(sub)
+        if s is None:
+            s = str(sub)
+            sub_str_cache[sub] = s
+        return s
+
     if full_scan:
         probe_ip_to_subnet: Dict[str, ipaddress.IPv4Network] = {}
         probe_alive: Set[str] = set()
-        probe_elapsed_s = 0.0
-        expand_targets: List[str] = []
-        expand_ip_to_subnet: Dict[str, ipaddress.IPv4Network] = {}
-        for sub in subnets:
-            for ip in all_scan_targets(sub):
-                expand_targets.append(ip)
-                expand_ip_to_subnet[ip] = sub
         notscanned_results: List[HostResult] = []
         active_subnets = list(subnets)
         skipped_subnets: List[ipaddress.IPv4Network] = []
+        total_expand_hosts = sum(subnet_host_count(sub) for sub in subnets)
+        expand_pairs = _iter_full_scan_pairs(subnets)
 
-        log(f"[scan] --full-scan: probe phase skipped, {len(expand_targets)} host(s) across "
+        log(f"[scan] --full-scan: probe phase skipped, {total_expand_hosts} host(s) across "
             f"{len(subnets)} subnet(s) go straight to the ICMP reachability check")
         report_text, estimate_line = build_full_scan_report(subnets)
         log(estimate_line)
@@ -992,23 +1106,32 @@ def scan(networks, mask, mtu, count, timeout_ms, workers, interval,
             log("\nInterrupted during probe phase - nothing scanned yet.")
             return results, True
 
+        probed_by_subnet: Dict[ipaddress.IPv4Network, Set[str]] = {}
         probed_ok = {}
         for ip, sub in probe_ip_to_subnet.items():
             alive = ip in probe_alive
             probed_ok[sub] = probed_ok.get(sub, False) or alive
+            probed_by_subnet.setdefault(sub, set()).add(ip)
             if not alive:
-                results.append(HostResult(ip=ip, network=str(sub), reachable=False, pmtud_status="Unreachable"))
+                results.append(HostResult(ip=ip, network=sub_str(sub), reachable=False, pmtud_status="Unreachable"))
             log(_fmt_probe_line(ip, alive))
 
-        expand_targets, expand_ip_to_subnet, notscanned_results = _build_expand_targets(
-            subnets, probe_ip_to_subnet, probed_ok
-        )
+        notscanned_results = [
+            HostResult(ip=str(sub.network_address), network=sub_str(sub), scanned=False,
+                       reachable=False, pmtud_status="NotScanned", note="probe subnet empty")
+            for sub in subnets if sub not in probed_ok
+        ]
 
         # Networks report + rough runtime estimate - written and shown right
         # after the probe phase, before the (potentially long) expand/MTU-test
         # phases start.
         active_subnets = [sub for sub in subnets if probed_ok.get(sub)]
         skipped_subnets = [sub for sub in subnets if not probed_ok.get(sub)]
+        total_expand_hosts = sum(subnet_host_count(sub) - len(probed_by_subnet.get(sub, ()))
+                                  for sub in active_subnets)
+        # A lazy generator (see _iter_expand_pairs), NOT the materialized
+        # _build_expand_targets() lists - see _EXPAND_BATCH_HOST_LIMIT.
+        expand_pairs = _iter_expand_pairs(subnets, probed_by_subnet, probed_ok)
         report_text, estimate_line = build_scanned_networks_report(
             active_subnets, skipped_subnets, len(probe_alive), len(probe_ip_to_subnet),
             count, interval, timeout_ms, workers, icmp_timeout_s, icmp_retries, probe_elapsed_s,
@@ -1024,40 +1147,58 @@ def scan(networks, mask, mtu, count, timeout_ms, workers, interval,
 
     results.extend(notscanned_results)
 
-    try:
-        if expand_targets:
-            log(f"[icmp] expand phase: {len(expand_targets)} host(s) across "
-                f"{len(active_subnets)} active subnet(s)...")
-        expand_alive = icmp_alive(expand_targets, icmp_timeout_s, icmp_retries,
-                                   send_burst=icmp_send_burst, send_pause=icmp_send_pause)
-    except KeyboardInterrupt:
-        log("\nInterrupted during expand phase - writing out probe-phase results so far...")
-        return results, True
+    if total_expand_hosts:
+        log(f"[icmp] expand phase: {total_expand_hosts} host(s) across "
+            f"{len(active_subnets)} active subnet(s), processed in batches of up to "
+            f"{_EXPAND_BATCH_HOST_LIMIT} host(s) each to bound memory use...")
 
-    mtu_test_targets: List[tuple] = []
-    for ip in expand_targets:
-        sub = expand_ip_to_subnet[ip]
-        if ip in expand_alive:
-            mtu_test_targets.append((ip, sub))
-        else:
-            unreachable = HostResult(ip=ip, network=str(sub), reachable=False, pmtud_status="Unreachable")
-            results.append(unreachable)
-            log(_fmt_scan_line(unreachable))
-    for ip, sub in probe_ip_to_subnet.items():
-        if ip in probe_alive:
-            mtu_test_targets.append((ip, sub))
-
+    # The MTU/DF-test thread pool stays open across every expand-phase batch
+    # (rather than being built only after ALL expand-phase ICMP work is
+    # done) so batch N+1's ICMP sweep can run while batch N's alive hosts are
+    # still being ping-tested - _MAX_PENDING_MTU_FUTURES_PER_WORKER bounds how
+    # far the pool can fall behind before a batch pauses to drain it, so
+    # memory for in-flight/completed-but-undrained futures stays bounded too.
+    max_pending = max(1, workers) * _MAX_PENDING_MTU_FUTURES_PER_WORKER
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+    pending: Dict[concurrent.futures.Future, tuple] = {}
+
+    def _drain(target_pending_count: int) -> None:
+        while len(pending) > target_pending_count:
+            done, _ = concurrent.futures.wait(list(pending.keys()),
+                                               return_when=concurrent.futures.FIRST_COMPLETED)
+            for fut in done:
+                sub, ip = pending.pop(fut)
+                r = _future_result_or_error(fut, ip, sub_str(sub))
+                results.append(r)
+                log(_fmt_scan_line(r))
+
     try:
-        futs = {}
-        for ip, sub in mtu_test_targets:
-            fut = pool.submit(mtu_test_host, ip, str(sub), mtu, count, timeout_ms, interval)
-            futs[fut] = (sub, ip)
-        for fut in concurrent.futures.as_completed(futs):
-            sub, ip = futs[fut]
-            r = _future_result_or_error(fut, ip, str(sub))
-            results.append(r)
-            log(_fmt_scan_line(r))
+        for batch_targets, batch_ip_to_subnet in _iter_target_batches(expand_pairs):
+            try:
+                batch_alive = icmp_alive(batch_targets, icmp_timeout_s, icmp_retries,
+                                          send_burst=icmp_send_burst, send_pause=icmp_send_pause)
+            except KeyboardInterrupt:
+                log("\nInterrupted during expand phase - writing out what was scanned so far...")
+                _fast_pool_shutdown(pool)
+                return results, True
+
+            for ip in batch_targets:
+                sub = batch_ip_to_subnet[ip]
+                if ip in batch_alive:
+                    fut = pool.submit(mtu_test_host, ip, sub_str(sub), mtu, count, timeout_ms, interval)
+                    pending[fut] = (sub, ip)
+                else:
+                    unreachable = HostResult(ip=ip, network=sub_str(sub), reachable=False, pmtud_status="Unreachable")
+                    results.append(unreachable)
+                    log(_fmt_scan_line(unreachable))
+            _drain(max_pending)
+
+        for ip, sub in probe_ip_to_subnet.items():
+            if ip in probe_alive:
+                fut = pool.submit(mtu_test_host, ip, sub_str(sub), mtu, count, timeout_ms, interval)
+                pending[fut] = (sub, ip)
+
+        _drain(0)
         pool.shutdown(wait=True)
     except KeyboardInterrupt:
         interrupted = True
@@ -1138,34 +1279,77 @@ def _xlsx_cell_xml(col: int, row: int, value, style: int) -> str:
     return f'<c r="{ref}" s="{style}" t="inlineStr"><is><t>{text}</t></is></c>'
 
 
-def _xlsx_sheet_xml(header: list, sorted_rows: list, status_col_idx: int, col_widths: list) -> str:
-    all_rows = [header] + sorted_rows
-    n_rows, n_cols = len(all_rows), len(header)
-    dim_ref = f"A1:{_xlsx_col_letter(n_cols)}{n_rows}"
+# How many worksheet rows' worth of XML text write_excel() builds as one
+# Python string before flushing it into the open zip-entry stream. Confirmed
+# on real hardware: a --full-scan of a /8 (~16.7M hosts) got OOM-killed on a
+# 16GB machine even AFTER the expand-phase batching fix, because the whole
+# sheet's XML used to be built as ONE giant string (row_chunks list + a
+# final "".join()) before being handed to zipfile.writestr() - for that many
+# rows, that one step alone needed well over 10GB, on top of the results/
+# rows lists already held for the whole scan. Streaming the sheet directly
+# into the zip entry in bounded row batches (see _xlsx_write_sheet) keeps
+# this step's own memory to a small, constant multiple of this batch size
+# instead of the whole sheet, regardless of scan size.
+_XLSX_STREAM_BATCH_ROWS = 5000
+
+
+def _xlsx_row_xml(r_idx: int, row: list, status_col_idx: int) -> str:
+    style = _STYLE_HEADER if r_idx == 1 else _STATUS_STYLE.get(row[status_col_idx], _STYLE_DEFAULT)
+    cells = "".join(_xlsx_cell_xml(c_idx, r_idx, v, style) for c_idx, v in enumerate(row, start=1))
+    return f'<row r="{r_idx}">{cells}</row>'
+
+
+def _xlsx_write_sheet(zf, name: str, header: list, sorted_rows: list,
+                       status_col_idx: int, col_widths: list) -> None:
+    """Write one worksheet's XML as a stream directly into the open zip
+    archive `zf`, instead of building the whole sheet as one Python string
+    first - see _XLSX_STREAM_BATCH_ROWS above for why.
+
+    force_zip64=True is required here: confirmed on real hardware, a
+    --full-scan of a /8 (~16.7M hosts) produced a single sheet's UNCOMPRESSED
+    XML well over 4 GiB (the classic (non-ZIP64) per-file size limit) even
+    though the fix above keeps this function's own peak memory small - the
+    two problems are independent (how much text gets built AT ONCE vs. how
+    much text a sheet adds up to IN TOTAL). Without force_zip64, zipfile only
+    reserves classic (32-bit) size fields when the entry is opened and raises
+    "File size unexpectedly exceeded ZIP64 limit" the moment actual written
+    data crosses that 4 GiB line - exactly what happened here. Forcing
+    ZIP64 fields up front costs a few extra header bytes per entry and is
+    otherwise free; every mainstream tool (Excel included) reads ZIP64 xlsx
+    files fine, so there's no reason not to just always use it here."""
+    n_rows_total = len(sorted_rows) + 1
+    n_cols = len(header)
+    dim_ref = f"A1:{_xlsx_col_letter(n_cols)}{n_rows_total}"
     cols_xml = "".join(
         f'<col min="{i + 1}" max="{i + 1}" width="{w}" customWidth="1"/>'
         for i, w in enumerate(col_widths)
     )
-    row_chunks = []
-    for r_idx, row in enumerate(all_rows, start=1):
-        if r_idx == 1:
-            style = _STYLE_HEADER
-        else:
-            style = _STATUS_STYLE.get(row[status_col_idx], _STYLE_DEFAULT)
-        cells = "".join(_xlsx_cell_xml(c_idx, r_idx, v, style) for c_idx, v in enumerate(row, start=1))
-        row_chunks.append(f'<row r="{r_idx}">{cells}</row>')
-    return (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        f'<worksheet xmlns="{_XLSX_NS_MAIN}">'
-        f'<dimension ref="{dim_ref}"/>'
-        '<sheetViews><sheetView workbookViewId="0">'
-        '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>'
-        '</sheetView></sheetViews>'
-        f'<cols>{cols_xml}</cols>'
-        f'<sheetData>{"".join(row_chunks)}</sheetData>'
-        f'<autoFilter ref="{dim_ref}"/>'
-        '</worksheet>'
-    )
+    with zf.open(name, "w", force_zip64=True) as f:
+        f.write((
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<worksheet xmlns="{_XLSX_NS_MAIN}">'
+            f'<dimension ref="{dim_ref}"/>'
+            '<sheetViews><sheetView workbookViewId="0">'
+            '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>'
+            '</sheetView></sheetViews>'
+            f'<cols>{cols_xml}</cols>'
+            '<sheetData>'
+        ).encode("utf-8"))
+
+        batch = [_xlsx_row_xml(1, header, status_col_idx)]
+        for r_idx, row in enumerate(sorted_rows, start=2):
+            batch.append(_xlsx_row_xml(r_idx, row, status_col_idx))
+            if len(batch) >= _XLSX_STREAM_BATCH_ROWS:
+                f.write("".join(batch).encode("utf-8"))
+                batch = []
+        if batch:
+            f.write("".join(batch).encode("utf-8"))
+
+        f.write((
+            '</sheetData>'
+            f'<autoFilter ref="{dim_ref}"/>'
+            '</worksheet>'
+        ).encode("utf-8"))
 
 
 def _xlsx_styles_xml() -> str:
@@ -1200,16 +1384,24 @@ def _xlsx_styles_xml() -> str:
     )
 
 
-def write_excel(rows, path: Path):
+def write_excel(rows, path: Path, sheets: Optional[list] = None):
+    """sheets, if given, is [(name, sorted_rows), ...] already sorted by the
+    caller - main() passes the SAME sorted lists it already built for the
+    sorted_by_*.txt files, instead of this function re-sorting `rows` itself
+    for each of the 3 tabs a second time (a real, if secondary, cost at
+    millions of rows). rows is still accepted on its own (and still used for
+    total-row-count bookkeeping) so this stays callable standalone, e.g. from
+    tests, without needing to pre-sort anything."""
     import zipfile
 
     status_col_idx = COLUMNS.index("PMTUD_Status")
     col_widths = [max(10, len(c) + 2) for c in COLUMNS]
-    sheets = [
-        ("By_IP", sort_by_ip(rows)),
-        ("By_Octet2", sort_by_octet(rows, 2)),
-        ("By_Octet3", sort_by_octet(rows, 3)),
-    ]
+    if sheets is None:
+        sheets = [
+            ("By_IP", sort_by_ip(rows)),
+            ("By_Octet2", sort_by_octet(rows, 2)),
+            ("By_Octet3", sort_by_octet(rows, 3)),
+        ]
 
     content_types = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -1258,9 +1450,9 @@ def write_excel(rows, path: Path):
         z.writestr("xl/workbook.xml", workbook_xml)
         z.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
         z.writestr("xl/styles.xml", _xlsx_styles_xml())
-        for i, (name, sorted_rows) in enumerate(sheets, start=1):
-            z.writestr(f"xl/worksheets/sheet{i}.xml",
-                       _xlsx_sheet_xml(COLUMNS, sorted_rows, status_col_idx, col_widths))
+        for i, (_name, sorted_rows) in enumerate(sheets, start=1):
+            _xlsx_write_sheet(z, f"xl/worksheets/sheet{i}.xml", COLUMNS, sorted_rows,
+                               status_col_idx, col_widths)
 
 
 def write_text(rows, path: Path, title: str):
@@ -1270,6 +1462,37 @@ def write_text(rows, path: Path, title: str):
         f.write("  ".join(c.ljust(w) for c, w in zip(COLUMNS, widths)) + "\n")
         for row in rows:
             f.write("  ".join(str(v).ljust(w) for v, w in zip(row, widths)) + "\n")
+
+
+def write_recheck_file(results: List[HostResult], path: Path, status: str) -> int:
+    """Write one host per line as a bare /32 CIDR, sorted by IP, for every
+    result whose pmtud_status == status - ready to hand straight back in via
+    '-f <this file> --full-scan' for a focused, low-concurrency recheck.
+    Confirmed on real hardware: hosts flagged Blackhole (or, less often,
+    DF-Needed) during a huge, heavily-loaded scan are frequently NOT
+    reproducible on an isolated recheck of just those hosts - almost always
+    caused by contention on the scanning machine itself (CPU/socket buffers/
+    egress bandwidth from tens of thousands of concurrent ICMP sends and
+    ping subprocesses) or by ICMP rate-limiting on routers along the path
+    (very common - many devices throttle how many Fragmentation-Needed
+    replies they generate per second, so which specific hosts get a genuine
+    reply vs. silently miss out varies run to run when many DF-set pings for
+    hosts behind the same router fire close together), NOT a real per-host
+    property. So the recheck workflow this supports - rerun with far fewer
+    hosts and no other scan competing for local resources - is the right way
+    to get a trustworthy final answer, and writing these files automatically
+    means that recheck no longer has to be built by hand from the .xlsx.
+    Always written, even with zero matching hosts (a script depending on the
+    file's presence shouldn't have to special-case an empty run). Returns
+    the number of hosts written."""
+    matching = sorted(
+        (r for r in results if r.pmtud_status == status),
+        key=lambda r: tuple(int(p) for p in r.ip.split("."))
+    )
+    with open(path, "w") as f:
+        for r in matching:
+            f.write(f"{r.ip}/32\n")
+    return len(matching)
 
 
 _STATUS_ORDER = ["OK", "DF-Needed", "Blackhole", "LocalMTUTooSmall", "Error", "Unreachable", "NotScanned"]
@@ -1554,13 +1777,33 @@ def main():
     elapsed = time.monotonic() - t0
     rows = [to_row(r) for r in results]
 
-    write_text(sort_by_ip(rows), outdir / "sorted_by_ip.txt", "sorted by full IP")
-    write_text(sort_by_octet(rows, 2), outdir / "sorted_by_octet2.txt", "sorted by 2nd octet")
-    write_text(sort_by_octet(rows, 3), outdir / "sorted_by_octet3.txt", "sorted by 3rd octet")
+    # Sort once per order and reuse for both the .txt files and the xlsx
+    # tabs (write_excel's sheets= param), instead of sorting the same rows
+    # a second time for the xlsx sheets - halves the total sorting work for
+    # very large scans, where each sort itself is a real, if secondary, cost.
+    by_ip = sort_by_ip(rows)
+    by_octet2 = sort_by_octet(rows, 2)
+    by_octet3 = sort_by_octet(rows, 3)
+
+    write_text(by_ip, outdir / "sorted_by_ip.txt", "sorted by full IP")
+    write_text(by_octet2, outdir / "sorted_by_octet2.txt", "sorted by 2nd octet")
+    write_text(by_octet3, outdir / "sorted_by_octet3.txt", "sorted by 3rd octet")
     try:
-        write_excel(rows, outdir / "mtu_scan_results.xlsx")
+        write_excel(rows, outdir / "mtu_scan_results.xlsx",
+                     sheets=[("By_IP", by_ip), ("By_Octet2", by_octet2), ("By_Octet3", by_octet3)])
     except Exception as e:
         print(f"WARNING: xlsx write failed ({e}); text results are still in {outdir}")
+
+    # recheck-blackhole.txt / recheck-df.txt: ready-to-use '-f ... --full-scan'
+    # input files for a focused, low-concurrency recheck of exactly the hosts
+    # flagged Blackhole / DF-Needed in this run - see write_recheck_file for
+    # why that recheck matters (real-hardware confirmed: both statuses are
+    # often not reproducible in isolation from a huge, heavily-loaded scan).
+    recheck_blackhole_count = write_recheck_file(results, outdir / "recheck-blackhole.txt", "Blackhole")
+    recheck_df_count = write_recheck_file(results, outdir / "recheck-df.txt", "DF-Needed")
+    print(f"[recheck] {recheck_blackhole_count} Blackhole host(s) -> recheck-blackhole.txt, "
+          f"{recheck_df_count} DF-Needed host(s) -> recheck-df.txt "
+          f"(re-run with '-f <file> --full-scan' to verify in isolation)")
 
     command_line = " ".join(["python3"] + sys.argv)
     interval_opt = (f"{effective_interval}s" if effective_interval == args.interval
